@@ -27,21 +27,22 @@ from plot_loudness import DEFAULT_FLOOR_DB, db_fs, envelopes, load_audio, lufs_s
 CLI = Path(r"C:\Program Files\ACE Studio\acestudio-cli.exe")
 CREATE_NO_WINDOW = 0x08000000
 PID_FILE = Path(os.environ.get("TEMP", ".")) / "ace-loudness-overlay.pid"
-HEADER_H = 52
-MIN_H = 108
-MIN_W = 360
-DEFAULT_W = 540
-DEFAULT_H = 150
+HEADER_H = 44
+MIN_H = 132
+MIN_W = 480
+DEFAULT_W = 720
+DEFAULT_H = 184
 FOLLOW_SPAN = 8.0
-BG = "#0e1016"
-CHROME = "#161a22"
-BTN = "#252a36"
-BTN_ON = "#2d6a52"
-BTN_DANGER = "#5a2430"
-FG = "#e8edf4"
-MUTED = "#8b93a2"
-ACCENT = "#6ee7b7"
-REF_FG = "#f0b45a"
+BG = "#101218"
+CHROME = "#181c24"
+BTN = "#2a303c"
+BTN_ON = "#3d8f6e"
+BTN_DANGER = "#8b3a48"
+LINE = "#2c3340"
+FG = "#f2f5fa"
+MUTED = "#9aa3b2"
+ACCENT = "#7dffc4"
+REF_FG = "#ffc56e"
 VOCAL_AUDIO_PREFIXES = ("歌声", "和声")
 
 
@@ -838,16 +839,16 @@ class Worker(threading.Thread):
             self.hud.exporting = False
 
 
-def _font():
+def _font(size: int = 11):
     from PIL import ImageFont
 
     for fp in (
+        r"C:\Windows\Fonts\segoeui.ttf",
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\msyh.ttf",
-        r"C:\Windows\Fonts\segoeui.ttf",
     ):
         try:
-            return ImageFont.truetype(fp, 12)
+            return ImageFont.truetype(fp, size)
         except Exception:
             continue
     return ImageFont.load_default()
@@ -866,61 +867,78 @@ def _cols(env: Env | None, t0: float, t1: float, w: int) -> tuple[np.ndarray, np
     return peak_col, rms_col
 
 
-def _draw_lane(draw, y0: int, y1: int, peak_col, rms_col, ymax: float, peak_rgb, rms_rgb) -> None:
-    w = len(peak_col)
-    mid = (y0 + y1) / 2.0
-    half = max(2.0, (y1 - y0) / 2.0 - 2.0)
-    draw.line([(0, mid), (w, mid)], fill="#3a4050")
-    for x in range(w):
-        p = peak_col[x] / ymax
-        r = rms_col[x] / ymax
-        if p <= 0.002:
-            continue
-        draw.line([(x, mid - p * half), (x, mid + p * half)], fill=peak_rgb)
-        if r > 0.002:
-            draw.line([(x, mid - r * half), (x, mid + r * half)], fill=rms_rgb)
+def _fill_lane(arr: np.ndarray, x0: int, y0: int, y1: int, peak, rms, ymax, peak_rgb, rms_rgb) -> None:
+    mid = (y0 + y1) // 2
+    half = max(2, (y1 - y0) // 2 - 2)
+    arr[mid, x0:] = (48, 54, 66)
+    ww = peak.shape[0]
+    for x in range(ww):
+        px = x0 + x
+        if px >= arr.shape[1]:
+            break
+        ph = int(peak[x] / ymax * half)
+        rh = int(rms[x] / ymax * half)
+        if ph > 0:
+            arr[max(y0, mid - ph) : min(y1, mid + ph + 1), px] = peak_rgb
+        if rh > 0:
+            arr[max(y0, mid - rh) : min(y1, mid + rh + 1), px] = rms_rgb
 
 
 def render_bar(w: int, h: int, hud: Hud) -> "Image.Image":
     from PIL import Image, ImageDraw
 
-    img = Image.new("RGB", (max(w, 1), max(h, 1)), "#12141a")
-    draw = ImageDraw.Draw(img, "RGBA")
-    font = _font()
+    w, h = max(int(w), 1), max(int(h), 1)
+    arr = np.full((h, w, 3), (16, 18, 24), dtype=np.uint8)
+    gutter = 44
+    time_h = 18
     t0, t1 = hud.view0, hud.view1
     if t1 <= t0:
         t1 = t0 + 1.0
-
-    cur_p, cur_r = _cols(hud.env, t0, t1, w)
-    ref_p, ref_r = _cols(hud.ref_env, t0, t1, w)
+    wave_w = max(1, w - gutter)
+    cur_p, cur_r = _cols(hud.env, t0, t1, wave_w)
+    ref_p, ref_r = _cols(hud.ref_env, t0, t1, wave_w)
     shared = max(
         float(np.max(cur_p)) if cur_p.size else 0.0,
         float(np.max(ref_p)) if ref_p.size else 0.0,
         1e-6,
     )
     ymax = max(1.0, shared * 1.04)
-
     compare = hud.ref_env is not None and hud.ref_env.t.size > 0
+    body_h = h - time_h
     if compare:
-        mid_split = h // 2
-        _draw_lane(draw, 1, mid_split - 1, cur_p, cur_r, ymax, (215, 221, 232, 230), (94, 224, 168, 210))
-        _draw_lane(draw, mid_split + 1, h - 16, ref_p, ref_r, ymax, (255, 196, 120, 230), (232, 150, 72, 210))
-        draw.line([(0, mid_split), (w, mid_split)], fill="#2c313c")
-        draw.text((6, 4), f"当前 {hud.track_name}", fill="#5ee0a8", font=font)
-        draw.text((6, mid_split + 4), f"参考 {hud.ref_name}", fill="#e0b25e", font=font)
+        split = body_h // 2
+        arr[0:split, 0:3] = (125, 255, 196)
+        arr[split:body_h, 0:3] = (255, 197, 110)
+        arr[split, gutter:] = (44, 51, 64)
+        _fill_lane(arr, gutter, 1, split - 1, cur_p, cur_r, ymax, (210, 220, 232), (92, 230, 170))
+        _fill_lane(arr, gutter, split + 1, body_h - 1, ref_p, ref_r, ymax, (255, 210, 150), (232, 150, 72))
     elif hud.env is not None and hud.env.t.size:
-        _draw_lane(draw, 1, h - 16, cur_p, cur_r, ymax, (215, 221, 232, 230), (94, 224, 168, 210))
-    else:
-        draw.text((10, h // 2 - 6), hud.msg or "无波形", fill="#8b909a", font=font)
+        arr[0:body_h, 0:3] = (125, 255, 196)
+        _fill_lane(arr, gutter, 1, body_h - 1, cur_p, cur_r, ymax, (210, 220, 232), (92, 230, 170))
+    arr[body_h:, :] = (20, 22, 28)
+    arr[body_h, :] = (44, 51, 64)
+
+    img = Image.fromarray(arr, "RGB")
+    draw = ImageDraw.Draw(img)
+    font = _font(11)
+    font_s = _font(10)
+    if compare:
+        split = body_h // 2
+        draw.text((8, 6), "当前", fill=(125, 255, 196), font=font_s)
+        draw.text((8, split + 6), "参考", fill=(255, 197, 110), font=font_s)
+    elif hud.env is None or not hud.env.t.size:
+        draw.text((gutter + 10, h // 2 - 8), hud.msg or "无波形", fill=(154, 163, 178), font=font)
 
     pt = current_play(hud)
-    px = int((pt - t0) / (t1 - t0) * w)
-    if 0 <= px < w:
-        draw.line([(px, 0), (px, h)], fill=(255, 92, 92, 255), width=2)
+    px = gutter + int((pt - t0) / (t1 - t0) * wave_w)
+    if gutter <= px < w:
+        draw.line([(px, 0), (px, body_h)], fill=(255, 88, 96), width=2)
 
-    draw.text((4, h - 14), f"{t0:.1f}s", fill="#8b909a", font=font)
-    draw.text((w - 54, h - 14), f"{t1:.1f}s", fill="#8b909a", font=font)
-    return img.convert("RGB")
+    draw.text((gutter + 6, h - 15), f"{t0:.1f}s", fill=(154, 163, 178), font=font_s)
+    label = f"{t1:.1f}s"
+    tw = draw.textlength(label, font=font_s) if hasattr(draw, "textlength") else 36
+    draw.text((w - tw - 8, h - 15), label, fill=(154, 163, 178), font=font_s)
+    return img
 
 
 class OverlayApp:
@@ -956,89 +974,83 @@ class OverlayApp:
         self._last_pan = 0.0
         self._choice_labels: list[str] = []
 
-        import tkinter.ttk as ttk
-
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure(
-            "Loud.TCombobox",
-            fieldbackground=BTN,
-            background=BTN,
-            foreground=FG,
-            arrowcolor=FG,
-            bordercolor=CHROME,
-            lightcolor=BTN,
-            darkcolor=BTN,
-            padding=2,
-        )
-        style.map(
-            "Loud.TCombobox",
-            fieldbackground=[("readonly", BTN)],
-            foreground=[("readonly", FG)],
-        )
-
         self.header = tk.Frame(self.root, bg=CHROME, height=HEADER_H)
-        self.header.pack(fill="x", side="top")
+        self.header.pack(fill="both", expand=True)
         self.header.pack_propagate(False)
-        row1 = tk.Frame(self.header, bg=CHROME)
-        row1.pack(fill="x", padx=6, pady=(4, 0))
-        row2 = tk.Frame(self.header, bg=CHROME)
-        row2.pack(fill="x", padx=6, pady=(2, 4))
+        bar = tk.Frame(self.header, bg=CHROME)
+        bar.pack(fill="both", expand=True, padx=8, pady=6)
 
-        def btn(text, cmd, parent, on=False):
+        def chip(text, cmd, parent):
             b = tk.Label(
                 parent,
                 text=text,
-                bg=BTN_ON if on else BTN,
+                bg=BTN,
                 fg=FG,
-                padx=7,
-                pady=1,
-                font=("Segoe UI", 8),
+                padx=9,
+                pady=3,
+                font=("Segoe UI", 9),
+                cursor="hand2",
             )
             b.bind("<Button-1>", lambda e, c=cmd: c())
-            b.pack(side="left", padx=2)
+            b.bind("<Enter>", lambda e, w=b: w.configure(bg="#343b4a") if w.cget("bg") == BTN else None)
+            b.bind("<Leave>", lambda e, w=b: w.configure(bg=BTN_ON if self._chip_on(w) else BTN))
+            b.pack(side="left", padx=(0, 4))
             return b
 
-        self.grip = tk.Label(row1, text="⋮⋮", bg=CHROME, fg=MUTED, font=("Segoe UI", 9), cursor="fleur")
-        self.grip.pack(side="left", padx=(0, 6))
-        tk.Label(row1, text="响度", bg=CHROME, fg=ACCENT, font=("Segoe UI Semibold", 9)).pack(side="left")
-        tk.Label(row1, text="当前", bg=CHROME, fg=ACCENT, font=("Segoe UI", 8)).pack(side="left", padx=(10, 2))
-        self.cur_var = tk.StringVar()
-        self.cur_box = ttk.Combobox(
-            row1, textvariable=self.cur_var, width=12, state="readonly", style="Loud.TCombobox"
-        )
-        self.cur_box.pack(side="left")
-        self.cur_box.bind("<<ComboboxSelected>>", self._on_pick_current)
-        tk.Label(row1, text="参考", bg=CHROME, fg=REF_FG, font=("Segoe UI", 8)).pack(side="left", padx=(8, 2))
-        self.ref_var = tk.StringVar()
-        self.ref_box = ttk.Combobox(
-            row1, textvariable=self.ref_var, width=12, state="readonly", style="Loud.TCombobox"
-        )
-        self.ref_box.pack(side="left")
-        self.ref_box.bind("<<ComboboxSelected>>", self._on_pick_ref)
-        close = tk.Label(row1, text=" × ", bg=BTN_DANGER, fg=FG, font=("Segoe UI", 10), cursor="hand2")
+        def menu_btn(parent, fg):
+            mb = tk.Menubutton(
+                parent,
+                text="…",
+                bg=BTN,
+                fg=fg,
+                activebackground="#343b4a",
+                activeforeground=fg,
+                relief="flat",
+                font=("Segoe UI", 9),
+                padx=10,
+                pady=3,
+                cursor="hand2",
+                direction="below",
+            )
+            menu = tk.Menu(
+                mb,
+                tearoff=0,
+                bg=CHROME,
+                fg=FG,
+                activebackground=BTN_ON,
+                activeforeground=FG,
+                bd=0,
+                font=("Segoe UI", 9),
+            )
+            mb.config(menu=menu)
+            mb.pack(side="left", padx=(0, 6))
+            return mb, menu
+
+        self.grip = tk.Label(bar, text="☰", bg=CHROME, fg=MUTED, font=("Segoe UI", 11), cursor="fleur")
+        self.grip.pack(side="left", padx=(0, 8))
+        tk.Label(bar, text="LOUD", bg=CHROME, fg=ACCENT, font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 10))
+        self.cur_btn, self.cur_menu = menu_btn(bar, ACCENT)
+        tk.Label(bar, text="↔", bg=CHROME, fg=MUTED, font=("Segoe UI", 10)).pack(side="left", padx=(0, 6))
+        self.ref_btn, self.ref_menu = menu_btn(bar, REF_FG)
+
+        close = tk.Label(bar, text="✕", bg=BTN_DANGER, fg=FG, font=("Segoe UI", 9), padx=8, pady=3, cursor="hand2")
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: self._close())
-
-        self.b_stick = btn("钉", self.toggle_stick, row2)
-        self.b_follow = btn("跟", self.toggle_follow, row2)
-        self.b_page = btn("页", self.toggle_page, row2)
-        self.b_through = btn("穿", self.toggle_through, row2)
-        self.b_refresh = btn("刷", lambda: self.cmds.put(("refresh", None)), row2)
-        self.stats = tk.Label(row2, text="", bg=CHROME, fg=MUTED, font=("Segoe UI", 8))
-        self.stats.pack(side="left", padx=8)
-        self.title = tk.Label(
-            row2, text="Shift+←/→ 翻页", bg=CHROME, fg="#5c6370", font=("Segoe UI", 7)
-        )
-        self.title.pack(side="right")
+        self.stats = tk.Label(bar, text="", bg=CHROME, fg=MUTED, font=("Consolas", 9))
+        self.stats.pack(side="right", padx=10)
+        tools = tk.Frame(bar, bg=CHROME)
+        tools.pack(side="left", padx=(10, 0))
+        self.b_stick = chip("钉", self.toggle_stick, tools)
+        self.b_follow = chip("跟", self.toggle_follow, tools)
+        self.b_page = chip("页", self.toggle_page, tools)
+        self.b_through = chip("穿", self.toggle_through, tools)
+        self.b_refresh = chip("刷", lambda: self.cmds.put(("refresh", None)), tools)
+        self.title = tk.Label(bar, text="", bg=CHROME, fg=MUTED)
 
         self.canvas = tk.Label(self.wave, bg=BG, bd=0, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
 
-        for wdg in (self.header, self.grip, self.stats, self.title, row1, row2):
+        for wdg in (self.header, self.grip, self.stats, bar):
             wdg.bind("<ButtonPress-1>", self._on_drag_start)
             wdg.bind("<B1-Motion>", self._on_drag)
             wdg.bind("<ButtonRelease-1>", self._on_drag_end)
@@ -1060,54 +1072,50 @@ class OverlayApp:
         self.root.after(30, self._ui_tick)
         self.root.after(80, self._poll_hotkeys)
 
-    def _on_pick_current(self, _e=None) -> None:
-        if self._syncing:
-            return
-        uuid = self._uuid_for_label(self.cur_var.get())
+    def _chip_on(self, w) -> bool:
+        return (
+            (w is self.b_stick and self.hud.stick)
+            or (w is self.b_follow and self.hud.follow)
+            or (w is self.b_page and self.hud.page)
+            or (w is self.b_through and self.hud.click_through)
+        )
+
+    def _short_label(self, label: str) -> str:
+        if not label:
+            return ""
+        if ". " in label:
+            label = label.split(". ", 1)[-1]
+        return label[:18]
+
+    def _on_menu_current(self, uuid: str) -> None:
         if uuid:
             self.cmds.put(("set_current", uuid))
 
-    def _on_pick_ref(self, _e=None) -> None:
-        if self._syncing:
-            return
-        label = self.ref_var.get()
-        if label == "（无）":
-            self.cmds.put(("set_ref", ""))
-            return
-        uuid = self._uuid_for_label(label)
+    def _on_menu_ref(self, uuid: str) -> None:
         self.cmds.put(("set_ref", uuid or ""))
-
-    def _uuid_for_label(self, label: str) -> str:
-        for c in self.hud.vocal_choices:
-            if c.get("label") == label:
-                return c.get("uuid") or ""
-        return ""
 
     def _sync_menus(self) -> None:
         choices = self.hud.vocal_choices or []
         labels = [c["label"] for c in choices]
         if labels != self._choice_labels:
             self._choice_labels = labels
-            self.cur_box["values"] = labels
-            self.ref_box["values"] = ["（无）"] + labels
-        self._syncing = True
-        try:
-            cur = next((c["label"] for c in choices if c.get("uuid") == self.hud.track_uuid), "")
-            if cur:
-                self.cur_var.set(cur)
-            if self.hud.ref_locked and not self.hud.pick_ref_uuid:
-                self.ref_var.set("（无）")
-            else:
-                ref = next((c["label"] for c in choices if c.get("uuid") == self.hud.ref_uuid), "")
-                if ref:
-                    self.ref_var.set(ref)
-                elif not self.hud.ref_uuid:
-                    self.ref_var.set("（无）")
-        finally:
-            self._syncing = False
+            self.cur_menu.delete(0, "end")
+            self.ref_menu.delete(0, "end")
+            self.ref_menu.add_command(label="（无）", command=lambda: self._on_menu_ref(""))
+            for c in choices:
+                u, lab = c.get("uuid") or "", c.get("label") or ""
+                self.cur_menu.add_command(label=lab, command=lambda uu=u: self._on_menu_current(uu))
+                self.ref_menu.add_command(label=lab, command=lambda uu=u: self._on_menu_ref(uu))
+        cur = next((c["label"] for c in choices if c.get("uuid") == self.hud.track_uuid), "")
+        self.cur_btn.configure(text=self._short_label(cur) or "当前轨")
+        if self.hud.ref_locked and not self.hud.pick_ref_uuid:
+            self.ref_btn.configure(text="无参考")
+        else:
+            ref = next((c["label"] for c in choices if c.get("uuid") == self.hud.ref_uuid), "")
+            self.ref_btn.configure(text=self._short_label(ref) or "参考轨")
 
     def _paint_btn(self, b, on: bool) -> None:
-        b.configure(bg=BTN_ON if on else BTN)
+        b.configure(bg=BTN_ON if on else BTN, fg=("#07140e" if on else FG))
 
     def toggle_stick(self) -> None:
         self.hud.stick = not self.hud.stick
@@ -1297,7 +1305,9 @@ class OverlayApp:
                 self._set_view(pt - span * 0.08, pt - span * 0.08 + span)
 
     def _time_at(self, x: int) -> float:
-        w = max(1, self.canvas.winfo_width())
+        gutter = 44
+        w = max(1, self.canvas.winfo_width() - gutter)
+        x = max(0, x - gutter)
         t0, t1 = self.hud.view0, self.hud.view1
         if t1 <= t0:
             t1 = t0 + 1.0
@@ -1354,26 +1364,24 @@ class OverlayApp:
         wid = int(widget.winfo_id())
         return win32gui.GetParent(wid) or wid
 
-    def _place_pair(self, ox: int, oy: int, ow: int, oh: int) -> None:
-        import win32con
-        import win32gui
+    def _ui_scale(self) -> float:
+        try:
+            import ctypes
 
+            hwnd = self.hud.ace[0] if self.hud.ace else self._hwnd_of(self.root)
+            dpi = ctypes.windll.user32.GetDpiForWindow(int(hwnd))
+            return max(1.0, float(dpi) / 96.0)
+        except Exception:
+            return 1.5
+
+    def _place_pair(self, ox: int, oy: int, ow: int, oh: int) -> None:
         ow = max(MIN_W, int(ow))
         oh = max(MIN_H, int(oh))
         self.hud.width, self.hud.height = ow, oh
         hh = HEADER_H
-        wh = max(40, oh - hh)
-        try:
-            hh_hwnd = self._hwnd_of(self.root)
-            wv_hwnd = self._hwnd_of(self.wave)
-            flags = win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW
-            win32gui.SetWindowPos(hh_hwnd, win32con.HWND_TOPMOST, int(ox), int(oy), ow, hh, flags)
-            win32gui.SetWindowPos(
-                wv_hwnd, win32con.HWND_TOPMOST, int(ox), int(oy) + hh, ow, wh, flags
-            )
-        except Exception:
-            self.root.geometry(f"{ow}x{hh}+{int(ox)}+{int(oy)}")
-            self.wave.geometry(f"{ow}x{wh}+{int(ox)}+{int(oy) + hh}")
+        wh = max(56, oh - hh)
+        self.root.geometry(f"{ow}x{hh}+{int(ox)}+{int(oy)}")
+        self.wave.geometry(f"{ow}x{wh}+{int(ox)}+{int(oy) + hh}")
         try:
             self.root.attributes("-topmost", True)
             self.wave.attributes("-topmost", True)
@@ -1384,13 +1392,14 @@ class OverlayApp:
         if self._drag:
             return
         ace = self.hud.ace
+        scale = self._ui_scale()
         if not self.hud.stick:
             if not self._placed:
                 if ace:
                     _ah, x, y, w, h = ace
                     ow, oh = self.hud.width, self.hud.height
-                    ox = int(x + w - ow - 16)
-                    oy = int(y + h - oh - 16)
+                    ox = int((x + w) / scale - ow - 14)
+                    oy = int((y + h) / scale - oh - 14)
                     self._place_pair(ox, oy, ow, oh)
                 self._placed = True
             return
@@ -1398,8 +1407,8 @@ class OverlayApp:
             return
         _ah, x, y, w, h = ace
         ow, oh = self.hud.width, self.hud.height
-        ox = int(x + w - ow - 16)
-        oy = int(y + h - oh - 16)
+        ox = int((x + w) / scale - ow - 14)
+        oy = int((y + h) / scale - oh - 14)
         pos = (ox, oy, ow, oh)
         if pos == self._last_pos:
             return
@@ -1463,7 +1472,7 @@ class OverlayApp:
 
 
 def main() -> int:
-    _dpi_aware()
+    # Leave DPI unaware so Tk sizes (640x184) match on-screen CSS pixels.
     kill_previous()
     write_pid()
     hud = Hud()
