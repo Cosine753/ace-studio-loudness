@@ -16,13 +16,23 @@ ACE has no piano-roll overlay SDK, so this is a HUD beside the editor.
 - Python 3 with `numpy`, `scipy`, `Pillow`, `pywin32`
 - Anaconda at `D:\Anaconda3` on the original machine; any Python with those packages works
 
-## Run
+## Run (as an app)
 
-```powershell
-python scripts/loudness_overlay.py
+On this Windows machine a Start Menu / Desktop shortcut **ACE Loudness** launches it with `pythonw` (no console). Double-click:
+
+```
+scripts/ace-loudness.vbs
 ```
 
-Or from Grok Build, with the skill installed under `~/.grok/skills/ace-studio-loudness/`.
+or:
+
+```powershell
+pythonw scripts/loudness_overlay.py
+```
+
+Settings (opacity, size, position) are saved to `%APPDATA%\ACELoudness\settings.json`.
+
+Drag the **透** slider to change window background opacity (40%–100%).
 
 ## Use
 

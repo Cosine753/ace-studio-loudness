@@ -28,6 +28,8 @@ from plot_loudness import DEFAULT_FLOOR_DB, db_fs, envelopes, load_audio, lufs_s
 CLI = Path(r"C:\Program Files\ACE Studio\acestudio-cli.exe")
 CREATE_NO_WINDOW = 0x08000000
 PID_FILE = Path(os.environ.get("TEMP", ".")) / "ace-loudness-overlay.pid"
+SETTINGS_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "ACELoudness" / "settings.json"
+ICON_PATH = SCRIPT_DIR / "ace-loudness.ico"
 HEADER_H = 44
 MIN_H = 132
 MIN_W = 480
@@ -109,6 +111,44 @@ def kill_previous() -> None:
 
 def write_pid() -> None:
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def load_settings() -> dict:
+    try:
+        if SETTINGS_PATH.exists():
+            return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_settings(data: dict) -> None:
+    try:
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def ensure_icon() -> Path | None:
+    if ICON_PATH.exists():
+        return ICON_PATH
+    try:
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGBA", (64, 64), (16, 18, 24, 255))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle((4, 4, 60, 60), 12, fill=(24, 28, 36, 255))
+        # mini waveform
+        pts = []
+        for i in range(12):
+            x = 10 + i * 4
+            h = 8 + (i * 7) % 18
+            d.rectangle((x, 32 - h, x + 2, 32 + h), fill=(125, 255, 196, 255))
+        img.save(ICON_PATH, format="ICO", sizes=[(16, 16), (32, 32), (64, 64)])
+        return ICON_PATH
+    except Exception:
+        return None
 
 
 def find_ace_rect() -> tuple[int, int, int, int, int] | None:
@@ -196,6 +236,9 @@ class Hud:
     ace: tuple[int, int, int, int, int] | None = None
     exporting: bool = False
     error: str = ""
+    opacity: float = 0.88
+    win_x: int | None = None
+    win_y: int | None = None
 
 
 def current_play(hud: Hud) -> float:
@@ -1177,18 +1220,34 @@ class OverlayApp:
         self.cmds = cmds
         self.tk = tk
         self.root = tk.Tk()
+        cfg = load_settings()
+        if cfg:
+            try:
+                hud.opacity = float(cfg.get("opacity", hud.opacity))
+                hud.width = int(cfg.get("width", hud.width))
+                hud.height = int(cfg.get("height", hud.height))
+                hud.stick = bool(cfg.get("stick", hud.stick))
+                hud.follow = bool(cfg.get("follow", hud.follow))
+                hud.page = bool(cfg.get("page", hud.page))
+                if cfg.get("x") is not None:
+                    hud.win_x = int(cfg["x"])
+                    hud.win_y = int(cfg.get("y") or 80)
+            except Exception:
+                pass
+        ox = hud.win_x if hud.win_x is not None else 80
+        oy = hud.win_y if hud.win_y is not None else 80
         self.root.title("ACE 响度")
         self.root.configure(bg=CHROME)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.geometry(f"{DEFAULT_W}x{HEADER_H}+80+80")
+        self.root.geometry(f"{hud.width}x{HEADER_H}+{ox}+{oy}")
         self.root.minsize(MIN_W, HEADER_H)
         self.root.pack_propagate(False)
         self.wave = tk.Toplevel(self.root)
         self.wave.overrideredirect(True)
         self.wave.attributes("-topmost", True)
         self.wave.configure(bg=BG)
-        self.wave.geometry(f"{DEFAULT_W}x{DEFAULT_H - HEADER_H}+80+{80 + HEADER_H}")
+        self.wave.geometry(f"{hud.width}x{max(56, hud.height - HEADER_H)}+{ox}+{oy + HEADER_H}")
         self._photo = None
         self._drag = None
         self._last_size = (0, 0)
@@ -1273,6 +1332,30 @@ class OverlayApp:
         self.b_page = chip("页", self.toggle_page, tools)
         self.b_through = chip("穿", self.toggle_through, tools)
         self.b_refresh = chip("刷", lambda: self.cmds.put(("refresh", None)), tools)
+        tk.Label(tools, text="透", bg=CHROME, fg=MUTED, font=("Segoe UI", 8)).pack(side="left", padx=(6, 2))
+        self.op_var = tk.IntVar(value=int(round(max(0.35, min(1.0, hud.opacity)) * 100)))
+        self.op_scale = tk.Scale(
+            tools,
+            from_=40,
+            to=100,
+            orient="horizontal",
+            showvalue=0,
+            length=78,
+            width=10,
+            sliderlength=12,
+            bd=0,
+            highlightthickness=0,
+            bg=CHROME,
+            troughcolor=BTN,
+            activebackground=ACCENT,
+            fg=ACCENT,
+            variable=self.op_var,
+            command=self._on_opacity,
+        )
+        self.op_scale.pack(side="left", padx=(0, 4))
+        self.op_scale.bind("<ButtonRelease-1>", lambda e: self._persist())
+        self.op_lbl = tk.Label(tools, text=f"{self.op_var.get()}%", bg=CHROME, fg=MUTED, font=("Segoe UI", 8))
+        self.op_lbl.pack(side="left")
         self.title = tk.Label(bar, text="", bg=CHROME, fg=MUTED)
 
         self.canvas = tk.Label(self.wave, bg=BG, bd=0, cursor="crosshair")
@@ -1299,6 +1382,11 @@ class OverlayApp:
         self.wave.bind("<Shift-Right>", lambda e: self._pan(1))
         self.root.after(30, self._ui_tick)
         self.root.after(80, self._poll_hotkeys)
+        self.root.after(120, self._init_app_chrome)
+        self._apply_opacity()
+        if hud.win_x is not None:
+            self._placed = True
+            self._place_pair(ox, oy, hud.width, hud.height)
 
     def _chip_on(self, w) -> bool:
         return (
@@ -1368,7 +1456,68 @@ class OverlayApp:
         self._apply_through()
         self._paint_btn(self.b_through, self.hud.click_through)
 
+    def _persist(self) -> None:
+        try:
+            self.hud.win_x = int(self.root.winfo_x())
+            self.hud.win_y = int(self.root.winfo_y())
+        except Exception:
+            pass
+        save_settings(
+            {
+                "opacity": round(float(self.hud.opacity), 2),
+                "width": int(self.hud.width),
+                "height": int(self.hud.height),
+                "x": self.hud.win_x,
+                "y": self.hud.win_y,
+                "stick": bool(self.hud.stick),
+                "follow": bool(self.hud.follow),
+                "page": bool(self.hud.page),
+            }
+        )
+
+    def _apply_opacity(self) -> None:
+        a = max(0.40, min(1.0, float(self.hud.opacity)))
+        try:
+            self.root.attributes("-alpha", a)
+            self.wave.attributes("-alpha", a)
+        except Exception:
+            pass
+
+    def _on_opacity(self, _val=None) -> None:
+        pct = int(self.op_var.get())
+        self.hud.opacity = pct / 100.0
+        self.op_lbl.configure(text=f"{pct}%")
+        self._apply_opacity()
+
+    def _init_app_chrome(self) -> None:
+        ico = ensure_icon()
+        try:
+            if ico:
+                self.root.iconbitmap(str(ico))
+        except Exception:
+            pass
+        try:
+            import win32con
+            import win32gui
+
+            hwnd = self._hwnd_of(self.root)
+            ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            ex = (ex | win32con.WS_EX_APPWINDOW) & ~win32con.WS_EX_TOOLWINDOW
+            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex)
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED,
+            )
+        except Exception:
+            pass
+
     def _close(self) -> None:
+        self._persist()
         try:
             self.wave.destroy()
         except Exception:
@@ -1487,9 +1636,15 @@ class OverlayApp:
             if self.hud.stick:
                 self.hud.stick = False
                 self._paint_btn(self.b_stick, False)
+        try:
+            self.hud.win_x = int(self.root.winfo_x())
+            self.hud.win_y = int(self.root.winfo_y())
+        except Exception:
+            pass
 
     def _on_drag_end(self, e) -> None:
         self._drag = None
+        self._persist()
 
     def _clip_bounds(self) -> tuple[float, float]:
         lo = self.hud.begin_sec
