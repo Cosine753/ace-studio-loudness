@@ -28,10 +28,13 @@ inside ACE's piano roll (no overlay SDK). It is a topmost HUD that:
   pre-selects the piano-roll vocal and `歌声_本家` / `和声_本家` / a track
   named `参考`; after that the menus are the source of truth
 - same time axis and amplitude scale — fatter bar = louder
-- current Sing track is bounced **alone** (OpenUTAU-style per-phrase cache:
-  `iso_<track>_<fingerprint>.wav`, clip range only, mono, no extra FX). After
-  ACE synthesis finishes (`project synthesis-status`), the bar refreshes —
-  SynthV-style “render then show waveform”
+- current Sing track uses **OpenUtau-style phrases**: notes with a gap > 0.45s
+  become a new phrase; each phrase is hashed and cached as
+  `ph_<track>_<hash>.wav`. Unchanged phrases reload from disk. Missing phrases
+  bounce `--from/--to` one at a time and **appear as soon as they finish**
+  (blank where not ready). Waveform is per-pixel min/max like
+  `WaveformImage.cs`. After ACE `synthesis-status` goes idle, only changed
+  phrases re-export.
 - click the bar → `transport seek`; mouse wheel zooms
 
 Launch (kills any previous HUD first):

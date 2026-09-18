@@ -6,6 +6,7 @@ Docks to the ACE window, follows one open vocal plus a pasted 参考 vocal
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -44,6 +45,9 @@ MUTED = "#9aa3b2"
 ACCENT = "#7dffc4"
 REF_FG = "#ffc56e"
 VOCAL_AUDIO_PREFIXES = ("歌声", "和声")
+PHRASE_GAP_S = 0.45
+PHRASE_PAD_S = 0.12
+PHRASE_SR = 44100
 
 
 def _dpi_aware() -> None:
@@ -153,6 +157,10 @@ class Env:
     clip_uuid: str
     track_uuid: str
     title: str
+    samples: np.ndarray | None = None
+    sr: int = 0
+    sample_t0: float = 0.0
+    ready_ranges: list = field(default_factory=list)
 
 
 @dataclass
@@ -199,6 +207,107 @@ def current_play(hud: Hud) -> float:
 
 def uuid_stem(uuid: str) -> str:
     return (uuid or "").replace("{", "").replace("}", "").replace("-", "")[:12]
+
+
+def _tick_to_sec(tick: float, tick0: float, tick1: float, sec0: float, sec1: float) -> float:
+    span = max(1.0, tick1 - tick0)
+    return sec0 + (tick - tick0) / span * (sec1 - sec0)
+
+
+def split_phrases(notes: list, tick0: float, tick1: float, sec0: float, sec1: float) -> list[dict]:
+    """OpenUtau-style: consecutive notes with a small gap form one phrase."""
+    if not notes:
+        return []
+    notes = sorted(notes, key=lambda n: int(n.get("pos") or 0))
+    groups: list[list] = [[notes[0]]]
+    for n in notes[1:]:
+        prev = groups[-1][-1]
+        gap = _tick_to_sec(int(n.get("pos") or 0), tick0, tick1, sec0, sec1) - _tick_to_sec(
+            int(prev.get("endPos") or 0), tick0, tick1, sec0, sec1
+        )
+        if gap > PHRASE_GAP_S:
+            groups.append([n])
+        else:
+            groups[-1].append(n)
+    out = []
+    for g in groups:
+        t0 = _tick_to_sec(int(g[0].get("pos") or 0), tick0, tick1, sec0, sec1) - PHRASE_PAD_S
+        t1 = _tick_to_sec(int(g[-1].get("endPos") or 0), tick0, tick1, sec0, sec1) + PHRASE_PAD_S
+        t0 = max(sec0, t0)
+        t1 = min(sec1, max(t0 + 0.05, t1))
+        h = hashlib.sha1()
+        for n in g:
+            h.update(
+                f"{n.get('pos')}|{n.get('endPos')}|{n.get('pitch')}|{n.get('lyric')}|{n.get('dur')}".encode(
+                    "utf-8", "ignore"
+                )
+            )
+        out.append({"hash": h.hexdigest()[:12], "start": t0, "end": t1, "n": len(g)})
+    return out
+
+
+def _resample_mono(x: np.ndarray, sr: int, target: int) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    if sr == target or sr <= 0 or x.size == 0:
+        return x
+    n_new = max(1, int(round(len(x) * target / sr)))
+    return np.interp(np.linspace(0, 1, n_new), np.linspace(0, 1, len(x)), x)
+
+
+def mix_phrases(ready: list[dict], duration: float, sr: int = PHRASE_SR) -> tuple[np.ndarray, list]:
+    n = max(1, int(duration * sr) + 1)
+    buf = np.zeros(n, dtype=np.float64)
+    ranges = []
+    for p in ready:
+        x = p.get("x")
+        if x is None or not len(x):
+            continue
+        i0 = int(round(p["start"] * sr))
+        if i0 < 0:
+            x = x[-i0:]
+            i0 = 0
+        i1 = min(n, i0 + len(x))
+        take = i1 - i0
+        if take > 0:
+            buf[i0:i1] += x[:take]
+            ranges.append((float(p["start"]), float(p["end"])))
+    return buf, ranges
+
+
+def env_from_mix(
+    buf: np.ndarray,
+    sr: int,
+    duration: float,
+    clip_uuid: str,
+    track_uuid: str,
+    title: str,
+    ready_ranges: list,
+    path: str = "",
+) -> Env:
+    t, peak, rms = envelopes(buf, sr, 10.0)
+    peak_db = float(20.0 * np.log10(max(float(np.max(np.abs(buf))), 1e-12))) if buf.size else None
+    rms_db = float(20.0 * np.log10(max(float(np.sqrt(np.mean(buf * buf))), 1e-12))) if buf.size else None
+    return Env(
+        t=t,
+        peak=peak,
+        rms=rms,
+        duration=float(duration),
+        stats={
+            "peak_db": None if peak_db is None else round(peak_db, 1),
+            "rms_db": None if rms_db is None else round(rms_db, 1),
+            "integrated_lufs": None if rms_db is None else round(rms_db + 0.7, 1),
+        },
+        path=path,
+        clip_uuid=clip_uuid,
+        track_uuid=track_uuid,
+        title=title,
+        samples=buf,
+        sr=sr,
+        sample_t0=0.0,
+        ready_ranges=ready_ranges,
+    )
 
 
 def is_vocal_track(
@@ -297,7 +406,10 @@ def apply_audio_clip_offset(env: Env, clip: dict | None) -> Env:
         return env
     begin = float(clip.get("clipBeginSec") or 0.0)
     cin = float(media.get("clipInSec") or 0.0)
-    env.t = env.t + (begin - cin)
+    off = begin - cin
+    env.t = env.t + off
+    env.sample_t0 = float(getattr(env, "sample_t0", 0.0) + off)
+    env.ready_ranges = [(a + off, b + off) for a, b in (env.ready_ranges or [])]
     return env
 
 
@@ -355,16 +467,21 @@ def load_env(path: Path, clip_uuid: str, track_uuid: str, title: str, quick: boo
         "rms_db": None if rms_db is None else round(rms_db, 1),
         "integrated_lufs": integ,
     }
+    dur = float(len(x) / sr) if sr else 0.0
     return Env(
         t=t,
         peak=peak,
         rms=rms,
-        duration=float(len(x) / sr) if sr else 0.0,
+        duration=dur,
         stats=stats_out,
         path=str(path),
         clip_uuid=clip_uuid,
         track_uuid=track_uuid,
         title=title,
+        samples=x,
+        sr=int(sr),
+        sample_t0=0.0,
+        ready_ranges=[(0.0, dur)] if dur else [],
     )
 
 
@@ -383,26 +500,13 @@ def clip_fingerprint(track_index: int, clip_index: int = 0) -> str:
     return raw.split(":")[-1][:16] if raw else ""
 
 
-def bounce_track(
-    track_uuid: str,
-    out_dir: Path,
-    track_name: str,
-    begin_sec: float = 0.0,
-    end_sec: float = 0.0,
-    fingerprint: str = "",
-) -> Path:
-    """Export ONE track, clip range only, mono, no external FX.
-
-    OpenUTAU caches per-phrase wavs; we cache per (track, fingerprint).
-    Cropping to the clip avoids ACE's full-arrangement tail leaking into the bar.
-    """
-    stem = uuid_stem(track_uuid) or "track"
-    fp = fingerprint or "x"
-    template = out_dir / f"iso_{stem}_{fp}.wav"
-    hits = sorted(out_dir.glob(f"iso_{stem}_{fp}*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+def bounce_range(track_uuid: str, out_dir: Path, start_s: float, end_s: float, cache_stem: str) -> Path:
+    """Export one time window. ACE appends the track name to --path."""
+    hits = sorted(out_dir.glob(f"{cache_stem}*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
     for p in hits:
         if p.stat().st_size > 1024:
             return p
+    template = out_dir / f"{cache_stem}.wav"
     args = [
         "export",
         "audio",
@@ -415,22 +519,37 @@ def bounce_track(
         "true",
         "--channels",
         "1",
+        "--from",
+        f"{start_s:.3f}s",
+        "--to",
+        f"{end_s:.3f}s",
         "--path",
         str(template),
     ]
-    if end_sec > begin_sec + 0.05:
-        args += ["--from", f"{begin_sec:.3f}s", "--to", f"{end_sec:.3f}s"]
     try:
-        ace_json(*args, timeout=600.0)
+        ace_json(*args, timeout=180.0)
     except Exception:
         pass
-    for _ in range(40):
-        hits = sorted(out_dir.glob(f"iso_{stem}_{fp}*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for _ in range(30):
+        hits = sorted(out_dir.glob(f"{cache_stem}*.wav"), key=lambda p: p.stat().st_mtime, reverse=True)
         for p in hits:
             if p.stat().st_size > 1024:
                 return p
-        time.sleep(0.4)
-    raise RuntimeError("export finished but no isolated wav for this vocal track")
+        time.sleep(0.3)
+    raise RuntimeError(f"phrase export failed: {cache_stem}")
+
+
+def bounce_track(
+    track_uuid: str,
+    out_dir: Path,
+    track_name: str,
+    begin_sec: float = 0.0,
+    end_sec: float = 0.0,
+    fingerprint: str = "",
+) -> Path:
+    stem = uuid_stem(track_uuid) or "track"
+    fp = fingerprint or "x"
+    return bounce_range(track_uuid, out_dir, begin_sec, end_sec if end_sec > begin_sec else begin_sec + 0.1, f"iso_{stem}_{fp}")
 
 
 class Worker(threading.Thread):
@@ -723,36 +842,90 @@ class Worker(threading.Thread):
         end = float((cur or {}).get("clipEndSec") or self.hud.end_sec or 0.0)
         if not force_bounce and track_uuid in self._env_cache:
             return self._env_cache[track_uuid]
-        fp = ""
-        path = None if force_bounce else resolve_audio(track_uuid, cur, self._out, track_name, fingerprint="")
-        if path is None and clip_type.lower() == "sing":
-            try:
-                idx = self.hud.track_index if track_index is None else track_index
-                fp = clip_fingerprint(idx, 0)
-            except Exception:
-                fp = ""
-            path = resolve_audio(track_uuid, cur, self._out, track_name, fingerprint=fp)
+        if clip_type.lower() == "sing":
+            env = self._load_sing_phrases(
+                track_uuid,
+                cur,
+                begin,
+                end,
+                (cur or {}).get("clipUuid") or clip_uuid,
+                title,
+                track_index,
+                force_bounce,
+            )
+            self._env_cache[track_uuid] = env
+            return env
+        path = resolve_audio(track_uuid, cur, self._out, track_name, fingerprint="")
         if path is None:
-            if clip_type.lower() == "audio":
-                path = resolve_audio(track_uuid, cur, self._out, track_name, fingerprint=fp)
-            if path is None:
-                self.hud.msg = "正在导出当前人声（单轨）…"
-                path = bounce_track(track_uuid, self._out, track_name, begin, end, fp)
+            self.hud.msg = "正在导出当前人声（单轨）…"
+            path = bounce_track(track_uuid, self._out, track_name, begin, end, "audio")
         env = load_env(path, (cur or {}).get("clipUuid") or clip_uuid, track_uuid, title, quick=True)
         env = apply_audio_clip_offset(env, cur)
-        if clip_type.lower() == "sing" and end > begin and env.t.size:
-            # keep only the clip window (drop arrangement tail)
-            dur = end - begin
-            keep = env.t <= (env.t[0] + dur + 0.05)
-            if np.any(keep) and not np.all(keep):
-                env.t = env.t[keep]
-                env.peak = env.peak[keep]
-                env.rms = env.rms[keep]
-                env.duration = float(dur)
-        if clip_type.lower() != "audio" and begin:
-            env.t = env.t + begin
-        self._loaded_fp = fp
         self._env_cache[track_uuid] = env
+        return env
+
+    def _load_sing_phrases(
+        self,
+        track_uuid: str,
+        cur: dict | None,
+        begin: float,
+        end: float,
+        clip_uuid: str,
+        title: str,
+        track_index: int | None,
+        force_bounce: bool,
+    ) -> Env:
+        idx = self.hud.track_index if track_index is None else track_index
+        data = ace_json(
+            "clip",
+            "note-content",
+            "--track-index",
+            str(idx),
+            "--clip-index",
+            "0",
+            timeout=30.0,
+        )
+        notes = data.get("notes") or []
+        tick0 = float((cur or {}).get("clipBegin") or 0.0)
+        tick1 = float((cur or {}).get("clipEnd") or 1.0)
+        if tick1 <= tick0:
+            tick1 = tick0 + 1.0
+        if end <= begin:
+            end = begin + 1.0
+        phrases = split_phrases(notes, tick0, tick1, begin, end)
+        stem = uuid_stem(track_uuid)
+        ready: list[dict] = []
+        missing: list[dict] = []
+        for p in phrases:
+            cache_stem = f"ph_{stem}_{p['hash']}"
+            hits = sorted(self._out.glob(f"{cache_stem}*.wav"), key=lambda q: q.stat().st_mtime, reverse=True)
+            wav = next((h for h in hits if h.stat().st_size > 1024), None)
+            if wav is not None:
+                sr, x = load_audio(wav, None)
+                ready.append({**p, "x": _resample_mono(x, sr, PHRASE_SR), "sr": PHRASE_SR, "path": str(wav)})
+            else:
+                missing.append(p)
+
+        def publish(msg: str) -> Env:
+            dur = max(end, begin + 0.1)
+            buf, ranges = mix_phrases(ready, dur, PHRASE_SR)
+            env = env_from_mix(buf, PHRASE_SR, dur, clip_uuid, track_uuid, title, ranges)
+            self.hud.env = env
+            self.hud.msg = msg
+            return env
+
+        env = publish(f"短语 {len(ready)}/{len(phrases)}")
+        for i, p in enumerate(missing):
+            cache_stem = f"ph_{stem}_{p['hash']}"
+            self.hud.msg = f"渲染短语 {len(ready) + 1}/{len(phrases)}"
+            try:
+                wav = bounce_range(track_uuid, self._out, p["start"], p["end"], cache_stem)
+                sr, x = load_audio(wav, None)
+                ready.append({**p, "x": _resample_mono(x, sr, PHRASE_SR), "sr": PHRASE_SR, "path": str(wav)})
+                env = publish(f"短语 {len(ready)}/{len(phrases)}")
+            except Exception as e:
+                self.hud.error = f"短语 {p['hash']}: {e}"[:160]
+        env = publish(f"短语 {len(ready)}/{len(phrases)}")
         return env
 
     def _ensure_reference(self, force_bounce: bool = False) -> None:
@@ -867,6 +1040,57 @@ def _cols(env: Env | None, t0: float, t1: float, w: int) -> tuple[np.ndarray, np
     return peak_col, rms_col
 
 
+def _minmax_cols(env: Env, t0: float, t1: float, w: int) -> tuple[np.ndarray, np.ndarray]:
+    """OpenUtau WaveformImage: per-pixel min/max; blank where no phrase is ready."""
+    ymin = np.full(w, np.nan, dtype=np.float64)
+    ymax = np.full(w, np.nan, dtype=np.float64)
+    samples = env.samples
+    sr = int(env.sr or 0)
+    if samples is None or sr <= 0 or t1 <= t0:
+        return ymin, ymax
+    origin = float(env.sample_t0 or 0.0)
+    n = len(samples)
+    ranges = env.ready_ranges or []
+    for i in range(w):
+        a = t0 + i / w * (t1 - t0)
+        b = t0 + (i + 1) / w * (t1 - t0)
+        covered = False
+        for r0, r1 in ranges:
+            if r1 > a and r0 < b:
+                covered = True
+                break
+        if not covered:
+            continue
+        s0 = int((a - origin) * sr)
+        s1 = int((b - origin) * sr)
+        s0 = max(0, min(n, s0))
+        s1 = max(0, min(n, s1))
+        if s1 <= s0:
+            continue
+        sl = samples[s0:s1]
+        ymin[i] = float(np.min(sl))
+        ymax[i] = float(np.max(sl))
+    return ymin, ymax
+
+
+def _fill_ou(arr: np.ndarray, x0: int, y0: int, y1: int, ymin, ymax, rgb) -> None:
+    mid = (y0 + y1) / 2.0
+    half = max(2.0, (y1 - y0) / 2.0 - 2.0)
+    ww = ymin.shape[0]
+    for x in range(ww):
+        mn, mx = ymin[x], ymax[x]
+        if not np.isfinite(mn):
+            continue
+        ya = int(mid - mx * half)
+        yb = int(mid - mn * half)
+        if ya > yb:
+            ya, yb = yb, ya
+        px = x0 + x
+        if px >= arr.shape[1]:
+            break
+        arr[max(y0, ya) : min(y1, yb + 1), px] = rgb
+
+
 def _fill_lane(arr: np.ndarray, x0: int, y0: int, y1: int, peak, rms, ymax, peak_rgb, rms_rgb) -> None:
     mid = (y0 + y1) // 2
     half = max(2, (y1 - y0) // 2 - 2)
@@ -895,26 +1119,30 @@ def render_bar(w: int, h: int, hud: Hud) -> "Image.Image":
     if t1 <= t0:
         t1 = t0 + 1.0
     wave_w = max(1, w - gutter)
-    cur_p, cur_r = _cols(hud.env, t0, t1, wave_w)
-    ref_p, ref_r = _cols(hud.ref_env, t0, t1, wave_w)
-    shared = max(
-        float(np.max(cur_p)) if cur_p.size else 0.0,
-        float(np.max(ref_p)) if ref_p.size else 0.0,
-        1e-6,
-    )
-    ymax = max(1.0, shared * 1.04)
-    compare = hud.ref_env is not None and hud.ref_env.t.size > 0
+    compare = hud.ref_env is not None and (hud.ref_env.t.size > 0 or (hud.ref_env.samples is not None))
     body_h = h - time_h
+
+    def _lane(env, y0, y1, peak_rgb, rms_rgb, ou_rgb):
+        if env is None:
+            return
+        if env.samples is not None and env.sr:
+            ymin, ymax = _minmax_cols(env, t0, t1, wave_w)
+            _fill_ou(arr, gutter, y0, y1, ymin, ymax, ou_rgb)
+            return
+        cur_p, cur_r = _cols(env, t0, t1, wave_w)
+        shared = max(float(np.max(cur_p)) if cur_p.size else 0.0, 1e-6)
+        _fill_lane(arr, gutter, y0, y1, cur_p, cur_r, max(1.0, shared * 1.04), peak_rgb, rms_rgb)
+
     if compare:
         split = body_h // 2
         arr[0:split, 0:3] = (125, 255, 196)
         arr[split:body_h, 0:3] = (255, 197, 110)
         arr[split, gutter:] = (44, 51, 64)
-        _fill_lane(arr, gutter, 1, split - 1, cur_p, cur_r, ymax, (210, 220, 232), (92, 230, 170))
-        _fill_lane(arr, gutter, split + 1, body_h - 1, ref_p, ref_r, ymax, (255, 210, 150), (232, 150, 72))
-    elif hud.env is not None and hud.env.t.size:
+        _lane(hud.env, 1, split - 1, (210, 220, 232), (92, 230, 170), (200, 210, 222))
+        _lane(hud.ref_env, split + 1, body_h - 1, (255, 210, 150), (232, 150, 72), (255, 186, 110))
+    elif hud.env is not None:
         arr[0:body_h, 0:3] = (125, 255, 196)
-        _fill_lane(arr, gutter, 1, body_h - 1, cur_p, cur_r, ymax, (210, 220, 232), (92, 230, 170))
+        _lane(hud.env, 1, body_h - 1, (210, 220, 232), (92, 230, 170), (200, 210, 222))
     arr[body_h:, :] = (20, 22, 28)
     arr[body_h, :] = (44, 51, 64)
 
